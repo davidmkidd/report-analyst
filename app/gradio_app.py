@@ -77,7 +77,17 @@ def create_app():
     service = DocumentService()
     progress_tracker = gr.Progress()
     
-    with gr.Blocks(title="TCFD Report Analyzer", theme=gr.themes.Soft()) as app:
+    with gr.Blocks(title="TCFD Report Analyzer", theme=gr.themes.Soft(), css="""
+        .question-result {
+            margin-bottom: 20px;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+        }
+        .question-result h3 {
+            margin-top: 0;
+        }
+    """) as app:
         gr.Markdown("# TCFD Report Analyzer")
         
         with gr.Tabs() as tabs:
@@ -96,11 +106,20 @@ def create_app():
                 with gr.Row():
                     progress = gr.Markdown("Upload a report to begin analysis")
                 
-                with gr.Row():
-                    current_question = gr.Markdown("## Current Question: Not started")
-                
-                with gr.Row():
-                    analysis_results = gr.Markdown("Results will appear here...")
+                # Results Section
+                with gr.Column(visible=False) as results_container:
+                    with gr.Row():
+                        gr.Markdown("## Analysis Results")
+                    
+                    # Accordion for each question
+                    questions_accordion = gr.Accordion("Questions", open=False)
+                    
+                    # DataFrame for summary view
+                    summary_df = gr.Dataframe(
+                        headers=["Question", "Score", "Answer Summary"],
+                        label="Analysis Summary",
+                        visible=False
+                    )
             
             # Questions Tab
             with gr.Tab("Questions"):
@@ -123,88 +142,77 @@ def create_app():
                     checkboxes.append(checkbox)
 
         async def process_analysis(file, *selected_questions):
-            formatted_results = "# Analysis Results\n\n"
+            results_container.visible = False
+            summary_data = []
             
             if not file:
-                yield "Please upload a file first", "## Current Question: Not started", "Waiting for file..."
+                yield "Please upload a file first", [], {}
                 return
-
+            
             try:
-                # Convert checkbox selections to question IDs (1-based indexing)
                 selected_ids = [i + 1 for i, selected in enumerate(selected_questions) if selected]
-                logger.info(f"Selected question IDs: {selected_ids}")
-                
                 if not selected_ids:
-                    yield "Please select at least one question", "## No questions selected", "Select questions to analyze"
+                    yield "Please select at least one question", [], {}
                     return
                 
-                total_steps = len(selected_ids)
-                current_step = 0
+                questions_html = ""
                 
                 async for result in service.process_document(file, selected_ids):
                     if "error" in result:
-                        yield (
-                            f"Error: {result['error']}", 
-                            "## Error occurred", 
-                            f"Error: {result['error']}"
-                        )
+                        yield f"Error: {result['error']}", [], {}
                         return
                     
                     if "status" in result:
                         progress_tracker(0, desc=result["status"])
                         continue
-                        
-                    # Always use the section name from the result, with TCFD Analysis as fallback
-                    section = result.get("section", "TCFD Analysis")
-                    question_num = result.get("question_number", 0)
-                    total_questions = result.get("total_questions", len(selected_ids))
-                    
-                    logger.info(f"Processing result from {section} question {question_num}/{total_questions}")
                     
                     try:
                         analysis = json.loads(result["result"])
-                        logger.info(f"Analysis for {section} Q{question_num}: Score={analysis.get('score', 'N/A')}")
-                        logger.info(f"Answer: {analysis.get('answer', 'No answer')[:100]}...")
+                        
+                        # Create accordion item for this question
+                        score_html = f'<div style="background-color: #FFA500; padding: 5px; display: inline-block; border-radius: 4px;">Score: {analysis.get("score", "N/A")}</div>'
+                        
+                        question_html = f"""
+                        <div class="question-result">
+                            <h3>Question {result['question_number']}</h3>
+                            {score_html}
+                            <p><strong>Q:</strong> {result['question']}</p>
+                            <p><strong>A:</strong> {analysis.get('answer', 'No answer provided')}</p>
+                        """
+                        
+                        if analysis.get('evidence'):
+                            question_html += "<p><strong>Evidence:</strong></p><ul>"
+                            question_html += "".join([f"<li>{e}</li>" for e in analysis['evidence']])
+                            question_html += "</ul>"
+                        
+                        if analysis.get('gaps'):
+                            question_html += "<p><strong>Gaps:</strong></p><ul>"
+                            question_html += "".join([f"<li>{g}</li>" for g in analysis['gaps']])
+                            question_html += "</ul>"
+                        
+                        question_html += "</div>"
+                        questions_html += question_html
+                        
+                        # Add to summary data
+                        summary_data.append([
+                            f"Q{result['question_number']}", 
+                            analysis.get('score', 'N/A'),
+                            analysis.get('answer', 'No answer')[:100] + "..."
+                        ])
+                        
+                        # Update UI
+                        results_container.visible = True
+                        yield questions_html, summary_data, {"visible": True}
+                        
                     except json.JSONDecodeError:
-                        analysis = {
-                            "answer": result["result"],
-                            "score": "N/A",
-                            "evidence": [],
-                            "gaps": []
-                        }
-                        logger.info(f"Raw result for {section} Q{question_num}: {result['result'][:100]}...")
-                    
-                    formatted_results += f"\n### Question {question_num}\n"
-                    formatted_results += f"**Q:** {result['question']}\n\n"
-                    formatted_results += f"**A:** {analysis.get('answer', 'No answer provided')}\n\n"
-                    if analysis.get('score') != 'N/A':
-                        formatted_results += f"**Score:** {analysis.get('score')}\n\n"
-                    if analysis.get('evidence'):
-                        formatted_results += "**Evidence:**\n" + "\n".join([f"- {e}" for e in analysis['evidence']]) + "\n\n"
-                    if analysis.get('gaps'):
-                        formatted_results += "**Gaps:**\n" + "\n".join([f"- {g}" for g in analysis['gaps']]) + "\n\n"
-                    
-                    current_step = question_num
-                    progress = current_step / total_questions
-                    
-                    yield (
-                        f"Analyzing {section}: Question {question_num}/{total_questions}",
-                        f"## Current Question:\n{result['question']}",
-                        formatted_results
-                    )
-                    progress_tracker(progress, desc=f"Processing question {question_num}/{total_questions}")
+                        logger.error("Failed to parse analysis result")
+                        continue
                 
-                progress_tracker(1.0, desc="Complete!")
-                logger.info("Analysis complete - Final results compiled")
-                yield "✓ Analysis Complete!", "## Analysis Complete", formatted_results
+                progress_tracker(1.0, desc="Analysis complete!")
                 
             except Exception as e:
                 logger.error(f"Error in analysis: {str(e)}", exc_info=True)
-                yield (
-                    f"Error: {str(e)}",
-                    "## Error occurred",
-                    f"Error occurred during analysis: {str(e)}"
-                )
+                yield f"Error: {str(e)}", [], {}
 
         def select_all_questions():
             """Select all questions"""
@@ -216,12 +224,15 @@ def create_app():
             logger.info("Clearing all questions")
             return [False] * len(checkboxes)
 
-        # Connect the buttons
+        # Connect components
         analyze_btn.click(
             fn=process_analysis,
             inputs=[file_input] + checkboxes,
-            outputs=[progress, current_question, analysis_results],
-            api_name="analyze"
+            outputs=[
+                questions_accordion,
+                summary_df,
+                results_container
+            ]
         )
         
         select_all.click(
