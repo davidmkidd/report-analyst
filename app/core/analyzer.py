@@ -273,9 +273,16 @@ class DocumentAnalyzer:
                 
                 try:
                     # Get relevant context using TOP_K=20
-                    docs = vectorstore.similarity_search(question_data['text'], k=20)
+                    docs_and_scores = vectorstore.similarity_search(question_data['text'], k=20)
+                    docs = [doc for doc, _ in docs_and_scores]
+                    scores = [score for _, score in docs_and_scores]
+                    
                     context = "\n".join(d.text for d in docs)
                     log_analysis_step(f"Retrieved {len(docs)} relevant chunks for question {q_id}", "debug")
+                    
+                    # Prepare chunks data for passing to frontend
+                    chunks_data = [{"text": d.text, "metadata": d.metadata, "relevance_score": float(s)} 
+                                 for d, s in docs_and_scores]
                     
                     # Get LLM response
                     messages = self.prompt_manager.get_analysis_messages(
@@ -310,7 +317,8 @@ class DocumentAnalyzer:
                                 "SCORE": result_json["SCORE"],
                                 "EVIDENCE": result_json["EVIDENCE"],
                                 "GAPS": result_json["GAPS"],
-                                "SOURCES": result_json["SOURCES"]
+                                "SOURCES": result_json["SOURCES"],
+                                "CHUNKS": chunks_data  # Add chunks to the response
                             })
                         }
                         

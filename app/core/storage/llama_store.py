@@ -111,8 +111,8 @@ class LlamaVectorStore(BaseVectorStore):
             logger.error(f"Error adding documents to vector store: {e}")
             raise
             
-    def similarity_search(self, query: str, k: int = 4) -> List[Document]:
-        """Search for similar documents."""
+    def similarity_search(self, query: str, k: int = 4) -> List[tuple[Document, float]]:
+        """Search for similar documents and return documents with their similarity scores."""
         if self.store is None:
             raise ValueError("Vector store not initialized")
             
@@ -120,9 +120,9 @@ class LlamaVectorStore(BaseVectorStore):
             # Get retriever from index
             retriever = self.store.as_retriever(similarity_top_k=k)
             
-            # Get nodes and convert to Document format
+            # Get nodes and convert to Document format with scores
             nodes = retriever.retrieve(query)
-            return [Document(text=node.node.text, metadata=node.node.metadata) for node in nodes]
+            return [(Document(text=node.node.text, metadata=node.node.metadata), node.score) for node in nodes]
             
         except Exception as e:
             logger.error(f"Error during similarity search: {e}")

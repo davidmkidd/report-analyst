@@ -237,6 +237,22 @@ async def analyze_document_and_display(analyzer, file_path: str, selected_questi
                     st.empty()  # Clear previous content
                     for display_id in results["answers"]:
                         display_results(results["answers"], analyzer.questions, display_id)
+                        
+                        # Display chunks in a dataframe if available
+                        result_data = results["answers"][display_id]
+                        if "CHUNKS" in result_data:
+                            st.subheader(f"Retrieved Context Chunks for Question {display_id}")
+                            chunks_df = pd.DataFrame(result_data["CHUNKS"])
+                            if not chunks_df.empty:
+                                # Clean up the display by selecting relevant columns
+                                display_df = chunks_df[["text", "metadata", "relevance_score"]].copy()
+                                # Convert metadata dict to string for better display
+                                display_df["metadata"] = display_df["metadata"].apply(lambda x: json.dumps(x, indent=2))
+                                # Format relevance score
+                                display_df["relevance_score"] = display_df["relevance_score"].apply(lambda x: f"{x:.4f}")
+                                # Sort by relevance score
+                                display_df = display_df.sort_values("relevance_score", ascending=False)
+                                st.dataframe(display_df, use_container_width=True)
             
             except json.JSONDecodeError as e:
                 log_analysis_step(f"JSON decode error for {q_id}: {str(e)}", "error")
