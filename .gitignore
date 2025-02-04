@@ -8,3 +8,9 @@ __pycache__/
 /temp
 
 **/__pycache__/
+
+# Storage and cache directories
+/storage/
+/app/storage/
+/app/cache/
+**/storage/cache/
