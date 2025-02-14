@@ -46,7 +46,7 @@ def create_analysis_dataframes(answers: Dict, report_name: str) -> Tuple[pd.Data
                 'Report Name': report_name,
                 'Question ID': question_id,
                 'Question Text': data.get('question_text', ''),
-                'Score': result.get('SCORE', 0),
+                'Score': float(result.get('SCORE', 0)),
                 'Analysis': result.get('ANSWER', ''),
                 'Key Evidence': format_list_field(result.get('EVIDENCE', [])),
                 'Gaps': format_list_field(result.get('GAPS', [])),
@@ -59,18 +59,18 @@ def create_analysis_dataframes(answers: Dict, report_name: str) -> Tuple[pd.Data
                 chunks_rows.append({
                     'Report Name': report_name,
                     'Question ID': question_id,
-                    'Position in Question': idx,  # Track position within question
+                    'Position in Question': int(idx),
                     'Chunk Text': chunk['text'],
-                    'Vector Similarity': chunk['relevance_score'],
-                    'LLM Score': chunk.get('computed_score', 0.0),
-                    'Evidence Reference': is_chunk_referenced(idx, result.get('EVIDENCE', []))
+                    'Vector Similarity': float(chunk['relevance_score']),
+                    'LLM Score': float(chunk.get('computed_score', 0.0)),
+                    'Evidence Reference': bool(is_chunk_referenced(idx, result.get('EVIDENCE', [])))
                 })
     
         except Exception as e:
             logger.error(f"Error processing answer for question {question_id}: {str(e)}")
             continue
 
-    # Create DataFrames
+    # Create DataFrames without explicit dtypes - let pandas infer them
     analysis_df = pd.DataFrame(analysis_rows)
     chunks_df = pd.DataFrame(chunks_rows)
     

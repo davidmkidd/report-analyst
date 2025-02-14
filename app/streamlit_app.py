@@ -12,6 +12,12 @@ import sys
 from dotenv import load_dotenv
 import traceback
 import time
+from pandas.api.types import (
+    is_categorical_dtype,
+    is_datetime64_any_dtype,
+    is_numeric_dtype,
+    is_object_dtype,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -120,6 +126,11 @@ def save_uploaded_file(uploaded_file) -> Optional[str]:
             logger.warning("No file was uploaded")
             return None
             
+        # If it's already a path, just return it
+        if isinstance(uploaded_file, (str, Path)):
+            return str(uploaded_file)
+            
+        # Otherwise, handle it as an UploadedFile
         file_path = Path("temp") / uploaded_file.name
         with open(file_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
@@ -253,6 +264,82 @@ async def analyze_document_and_display(analyzer, file_path: str, questions: Dict
         log_analysis_step(traceback.format_exc(), "error")
         st.error(f"Error during analysis: {str(e)}")
 
+def filter_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds a UI on top of a dataframe to let viewers filter columns
+    
+    Args:
+        df (pd.DataFrame): Original dataframe
+    Returns:
+        pd.DataFrame: Filtered dataframe
+    """
+    modify = st.checkbox("Add filters")
+
+    if not modify:
+        return df
+
+    df = df.copy()
+
+    # Try to convert datetimes into a standard format (datetime, no timezone)
+    for col in df.columns:
+        if is_object_dtype(df[col]):
+            try:
+                df[col] = pd.to_datetime(df[col])
+            except Exception:
+                pass
+
+        if is_datetime64_any_dtype(df[col]):
+            df[col] = df[col].dt.tz_localize(None)
+
+    modification_container = st.container()
+
+    with modification_container:
+        to_filter_columns = st.multiselect("Filter dataframe on", df.columns)
+        for column in to_filter_columns:
+            left, right = st.columns((1, 20))
+            left.write("↳")
+            
+            # Treat columns with < 10 unique values as categorical
+            if is_categorical_dtype(df[column]) or df[column].nunique() < 10:
+                user_cat_input = right.multiselect(
+                    f"Values for {column}",
+                    df[column].unique(),
+                    default=list(df[column].unique()),
+                )
+                df = df[df[column].isin(user_cat_input)]
+            elif is_numeric_dtype(df[column]):
+                _min = float(df[column].min())
+                _max = float(df[column].max())
+                step = (_max - _min) / 100
+                user_num_input = right.slider(
+                    f"Values for {column}",
+                    min_value=_min,
+                    max_value=_max,
+                    value=(_min, _max),
+                    step=step,
+                )
+                df = df[df[column].between(*user_num_input)]
+            elif is_datetime64_any_dtype(df[column]):
+                user_date_input = right.date_input(
+                    f"Values for {column}",
+                    value=(
+                        df[column].min(),
+                        df[column].max(),
+                    ),
+                )
+                if len(user_date_input) == 2:
+                    user_date_input = tuple(map(pd.to_datetime, user_date_input))
+                    start_date, end_date = user_date_input
+                    df = df.loc[df[column].between(start_date, end_date)]
+            else:
+                user_text_input = right.text_input(
+                    f"Substring or regex in {column}",
+                )
+                if user_text_input:
+                    df = df[df[column].astype(str).str.contains(user_text_input)]
+
+    return df
+
 def display_final_results(analysis_df: pd.DataFrame, chunks_df: pd.DataFrame):
     """Display the final results including both tables"""
     # Analysis Results
@@ -283,7 +370,7 @@ def display_final_results(analysis_df: pd.DataFrame, chunks_df: pd.DataFrame):
     # Document Chunks
     st.subheader("Document Chunks")
     st.dataframe(
-        chunks_df,
+        filter_dataframe(chunks_df),  # Apply the filter function
         column_config={
             "Question ID": st.column_config.SelectboxColumn(
                 "Question ID",
@@ -321,16 +408,70 @@ def display_final_results(analysis_df: pd.DataFrame, chunks_df: pd.DataFrame):
             )
         },
         use_container_width=True,
-        hide_index=False,
-        filters=True  # Enable filtering
+        hide_index=False
     )
 
+def load_question_sets() -> Dict[str, str]:
+    """Load all available question sets and their descriptions"""
+    question_sets = {}
+    question_sets_dir = Path(__file__).parent / "questionsets"
+    
+    for yaml_file in question_sets_dir.glob("*_questions.yaml"):
+        try:
+            with open(yaml_file, 'r') as f:
+                data = yaml.safe_load(f)
+                # Get set name from filename (e.g., 'tcfd' from 'tcfd_questions.yaml')
+                set_id = yaml_file.stem.replace('_questions', '')
+                question_sets[set_id] = {
+                    'name': data.get('name', set_id.upper()),
+                    'description': data.get('description', '')
+                }
+        except Exception as e:
+            logger.error(f"Error loading question set {yaml_file}: {e}")
+    
+    return question_sets
+
+def get_uploaded_files_history() -> List[Dict]:
+    """Get list of previously uploaded files from temp directory"""
+    temp_dir = Path("temp")
+    if not temp_dir.exists():
+        return []
+    
+    files = []
+    for file in temp_dir.glob("*.pdf"):
+        # Verify file exists and is not empty
+        if file.exists() and file.stat().st_size > 0:
+            files.append({
+                'name': file.name,
+                'path': str(file.resolve()),  # Get absolute path
+                'date': file.stat().st_mtime,
+                'size': file.stat().st_size
+            })
+            logger.info(f"Found file: {file.name}, size: {file.stat().st_size} bytes")
+    
+    # Sort by most recent first
+    return sorted(files, key=lambda x: x['date'], reverse=True)
+
 def main():
+    # Remove default Streamlit elements
     st.set_page_config(
         page_title="Report Analyzer",
         page_icon="📊",
-        layout="wide"
+        layout="wide",
+        menu_items={} # This removes the menu
     )
+    
+    # Hide Streamlit elements using CSS
+    st.markdown("""
+        <style>
+            #MainMenu {visibility: hidden;}
+            footer {visibility: hidden;}
+            .stDeployButton {display: none;}
+        </style>
+    """, unsafe_allow_html=True)
+    
+    st.title("Report Analyzer")
+    st.write("Upload a PDF report and select questions for sustainability report analysis.")
     
     # Initialize session state variables if they don't exist
     if 'analysis_complete' not in st.session_state:
@@ -340,12 +481,60 @@ def main():
     if 'analysis_triggered' not in st.session_state:
         st.session_state.analysis_triggered = False
     
-    st.title("Report Analyzer")
-    st.write("Upload a PDF report and select questions for sustainability report analysis.")
-    
     try:
         # Initialize analyzer
         analyzer = ReportAnalyzer()
+        
+        # Load available question sets
+        question_sets = load_question_sets()
+        
+        # Question set selection
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            selected_set = st.selectbox(
+                "Select Question Set",
+                options=list(question_sets.keys()),
+                format_func=lambda x: question_sets[x]['name']
+            )
+        
+        # Show question set description
+        with col2:
+            if selected_set in question_sets:
+                st.info(question_sets[selected_set]['description'])
+        
+        # File selection/upload
+        st.subheader("Select Report")
+        file_tab, upload_tab = st.tabs(["Previous Reports", "Upload New"])
+        
+        with file_tab:
+            previous_files = get_uploaded_files_history()
+            if previous_files:
+                # Show file details
+                st.write("Available files:")
+                for file in previous_files:
+                    st.write(f"- {file['name']} ({file['size']} bytes)")
+                    
+                selected_file = st.selectbox(
+                    "Select a previously analyzed report",
+                    options=previous_files,
+                    format_func=lambda x: x['name'],
+                    key="previous_file"
+                )
+                if selected_file:
+                    file_path = Path(selected_file['path'])
+                    if file_path.exists():
+                        st.write(f"Selected file exists: {file_path}")
+                        st.write(f"File size: {file_path.stat().st_size} bytes")
+                        st.session_state.uploaded_file = file_path
+                    else:
+                        st.error(f"File not found: {file_path}")
+            else:
+                st.info("No previously analyzed reports found")
+        
+        with upload_tab:
+            uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+            if uploaded_file:
+                st.session_state.uploaded_file = uploaded_file
         
         # Advanced options in expander
         with st.expander("Advanced Options"):
@@ -381,22 +570,10 @@ def main():
                     del st.session_state.llm_cache
                 st.success("Cache cleared!")
         
-        # Question set selection using session state
-        if 'current_question_set' not in st.session_state:
-            st.session_state.current_question_set = "tcfd"
-            
-        # File upload handling with session state
-        if 'uploaded_file' not in st.session_state:
-            st.session_state.uploaded_file = None
-            
-        uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
-        if uploaded_file is not None:
-            st.session_state.uploaded_file = uploaded_file
-        
         if st.session_state.uploaded_file:
             try:
                 # Load questions and handle selection
-                question_set_data = analyzer.load_question_set(st.session_state.current_question_set)
+                question_set_data = analyzer.load_question_set(selected_set)
                 questions = question_set_data["questions"]
                 
                 if question_set_data["description"]:
@@ -457,6 +634,34 @@ def main():
                 
     except Exception as e:
         st.error(f"Error initializing analyzer: {str(e)}")
+
+    # Add Climate+Tech footer at the end
+    footer = """
+    <style>
+    .footer {
+        position: fixed;
+        left: 0;
+        bottom: 0;
+        width: 100%;
+        background-color: #f1f1f1;
+        color: black;
+        text-align: center;
+        padding: 10px;
+        font-size: 14px;
+    }
+    .footer img {
+        height: 30px;
+        vertical-align: middle;
+        margin-right: 10px;
+    }
+    </style>
+    <div class="footer">
+        <img src="https://www.climateandtech.com/climateandtech.png" alt="Climate+Tech Logo">
+        <p>Climate+Tech Sustainability Report Analysis Tool</p>
+        <p>For custom tool development contact us at <a href="https://www.climateandtech.com" target="_blank">www.climateandtech.com</a></p>
+    </div>
+    """
+    st.markdown(footer, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main() 
