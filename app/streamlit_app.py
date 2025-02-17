@@ -136,11 +136,21 @@ def save_uploaded_file(uploaded_file) -> Optional[str]:
         if isinstance(uploaded_file, (str, Path)):
             return str(uploaded_file)
             
+        # Check if file was already saved in this session
+        file_key = f"saved_file_{uploaded_file.name}"
+        if file_key in st.session_state:
+            return st.session_state[file_key]
+            
         # Otherwise, handle it as an UploadedFile
         file_path = Path("temp") / uploaded_file.name
         with open(file_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
         logger.info(f"Successfully saved file: {file_path}")
+        
+        # Store the path in session state
+        st.session_state[file_key] = str(file_path)
+        # Reset file processing flag when a new file is saved
+        st.session_state.file_processed = False
         return str(file_path)
     except Exception as e:
         logger.error(f"Error saving file: {str(e)}")
@@ -225,25 +235,39 @@ async def analyze_document_and_display(analyzer, file_path: str, questions: Dict
         
         status_placeholder = st.empty()
         
-        async for result in analyzer.analyze_document(
-            file_path, 
-            questions,
-            selected_questions,
-            use_llm_scoring, 
-            single_call,
-            force_recompute
-        ):
-            if "error" in result:
-                log_analysis_step(f"Error received from analyzer: {result['error']}", "error")
-                st.error(f"Analysis error: {result['error']}")
-                continue
+        # Load cached answers first
+        cached_answers = {} if force_recompute else analyzer.analyzer._load_cached_answers(file_path)
+        
+        # Determine which questions need processing
+        questions_to_process = [q_id for q_id in selected_questions 
+                              if force_recompute or q_id not in cached_answers]
+        
+        # Add cached answers to results
+        for q_id in selected_questions:
+            if q_id in cached_answers and not force_recompute:
+                st.session_state.results["answers"][q_id] = cached_answers[q_id]
+        
+        if questions_to_process:
+            status_placeholder.write(f"Processing {len(questions_to_process)} questions...")
             
-            if "status" in result:
-                log_analysis_step(f"Status update: {result['status']}", "debug")
-                status_placeholder.write(result["status"])
-                continue
+            # Process only uncached questions
+            async for result in analyzer.analyze_document(
+                file_path, 
+                questions,
+                questions_to_process,
+                use_llm_scoring, 
+                single_call,
+                force_recompute
+            ):
+                if "error" in result:
+                    log_analysis_step(f"Error received from analyzer: {result['error']}", "error")
+                    st.error(f"Analysis error: {result['error']}")
+                    continue
                 
-            try:
+                if "status" in result:
+                    status_placeholder.write(result["status"])
+                    continue
+                    
                 question_id = result.get('question_id')
                 if question_id is None:
                     continue
@@ -251,36 +275,18 @@ async def analyze_document_and_display(analyzer, file_path: str, questions: Dict
                 # Store results
                 st.session_state.results["answers"][question_id] = result
                 
-                # Create DataFrames from results only if we have new data
-                if not hasattr(st.session_state, 'analysis_df') or question_id not in st.session_state.get('processed_questions', set()):
-                    analysis_df, chunks_df = create_analysis_dataframes(
-                        st.session_state.results["answers"], 
-                        Path(file_path).name
-                    )
-                    
-                    # Store in session state
-                    st.session_state.analysis_df = analysis_df
-                    st.session_state.chunks_df = chunks_df
-                    
-                    # Track which questions we've processed
-                    if 'processed_questions' not in st.session_state:
-                        st.session_state.processed_questions = set()
-                    st.session_state.processed_questions.add(question_id)
-                    
-                    # Use st.rerun instead of experimental_rerun
-                    st.rerun()
-                        
-            except Exception as e:
-                log_analysis_step(f"Unexpected error processing result: {str(e)}", "error")
-                log_analysis_step(traceback.format_exc(), "error")
-                st.error(f"Error processing result: {str(e)}")
-                continue
+                # Update display
+                analysis_df, chunks_df = create_analysis_dataframes(
+                    st.session_state.results["answers"], 
+                    Path(file_path).name
+                )
+                
+                st.session_state.analysis_df = analysis_df
+                st.session_state.chunks_df = chunks_df
         
-        # Mark analysis as complete
-        st.session_state.analysis_complete = True
-        
-        # Clear the status placeholder
+        # Clear status and mark as complete
         status_placeholder.empty()
+        st.session_state.analysis_complete = True
         
     except Exception as e:
         log_analysis_step(f"Critical error during analysis: {str(e)}", "error")
@@ -645,6 +651,10 @@ def main():
         st.subheader("Select Report")
         file_tab, upload_tab, consolidated_tab = st.tabs(["Previous Reports", "Upload New", "Consolidated Results"])
         
+        # Reset analysis state when switching files
+        if 'current_file' not in st.session_state:
+            st.session_state.current_file = None
+        
         with file_tab:
             previous_files = get_uploaded_files_history()
             if previous_files:
@@ -662,40 +672,39 @@ def main():
                 if selected_file:
                     file_path = Path(selected_file['path'])
                     if file_path.exists():
-                        st.write(f"Selected file exists: {file_path}")
-                        st.write(f"File size: {file_path.stat().st_size} bytes")
-                        st.session_state.uploaded_file = file_path
+                        if str(file_path) != st.session_state.current_file:
+                            st.session_state.current_file = str(file_path)
+                            st.session_state.uploaded_file = file_path
+                            # Reset analysis state
+                            st.session_state.analysis_complete = False
+                            st.session_state.analysis_triggered = False
+                            if 'results' in st.session_state:
+                                del st.session_state.results
                     else:
                         st.error(f"File not found: {file_path}")
             else:
                 st.info("No previously analyzed reports found")
         
         with upload_tab:
-            uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+            uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", key="file_uploader")
             if uploaded_file:
-                st.session_state.uploaded_file = uploaded_file
+                # Save the uploaded file and update session state
+                file_path = save_uploaded_file(uploaded_file)
+                if file_path and file_path != st.session_state.get('current_file'):
+                    st.session_state.current_file = file_path
+                    st.session_state.uploaded_file = uploaded_file
+                    # Reset analysis state
+                    st.session_state.analysis_complete = False
+                    st.session_state.analysis_triggered = False
+                    if 'results' in st.session_state:
+                        del st.session_state.results
+                    st.success(f"File uploaded successfully: {uploaded_file.name}")
+                    # Only rerun if we haven't processed this file yet
+                    if not st.session_state.get('file_processed'):
+                        st.session_state.file_processed = True
+                        st.rerun()
         
-        # Advanced options in expander
-        with st.expander("Advanced Options"):
-            st.session_state.use_llm_scoring = st.checkbox(
-                "Use LLM for relevance scoring",
-                value=st.session_state.use_llm_scoring
-            )
-            
-            if st.session_state.use_llm_scoring:
-                st.session_state.single_call = st.checkbox(
-                    "Score all chunks in single LLM call",
-                    value=st.session_state.single_call,
-                    help="More efficient but may be less accurate with large numbers of chunks"
-                )
-            
-            st.session_state.force_recompute = st.checkbox(
-                "Force recompute answers (ignore cache)",
-                value=st.session_state.force_recompute,
-                help="Recompute all answers even if they are cached"
-            )
-        
-        if st.session_state.uploaded_file:
+        if st.session_state.get('uploaded_file'):
             try:
                 # Load questions and handle selection
                 question_set_data = analyzer.load_question_set(selected_set)
@@ -704,26 +713,33 @@ def main():
                 if question_set_data["description"]:
                     st.write(question_set_data["description"])
                 
-                # Question selection with session state
+                # Question selection
                 st.subheader("Select Questions for Analysis")
+                
+                # Add "Select All" checkbox
+                select_all = st.checkbox("Select All Questions", key="select_all")
+                
+                # Question selection with Select All functionality
                 selected_questions = []
                 for q_id, q_data in questions.items():
                     if st.checkbox(
                         q_data['text'],
                         key=f"question_{q_id}",
-                        value=q_id in st.session_state.selected_questions
+                        value=select_all or q_id in st.session_state.get('selected_questions', [])
                     ):
                         selected_questions.append(q_id)
+                
+                # Store selected questions in session state
                 st.session_state.selected_questions = selected_questions
                 
                 # Create a single results container
                 results_container = st.container()
                 
                 # Add analysis trigger with proper state handling
-                if st.button("Analyze Document") or st.session_state.analysis_triggered:
+                if st.button("Analyze Document", key="analyze_button") or st.session_state.get('analysis_triggered', False):
                     st.session_state.analysis_triggered = True
                     
-                    if not st.session_state.analysis_complete:
+                    if not st.session_state.get('analysis_complete', False):
                         with st.spinner("Analyzing document..."):
                             file_path = save_uploaded_file(st.session_state.uploaded_file)
                             if file_path:
@@ -731,10 +747,10 @@ def main():
                                     analyzer,
                                     file_path,
                                     questions,
-                                    st.session_state.selected_questions,
+                                    selected_questions,
                                     st.session_state.use_llm_scoring,
                                     st.session_state.single_call,
-                                    st.session_state.force_recompute  # Pass force_recompute from session state
+                                    st.session_state.force_recompute
                                 ))
                 
                 # Display results if available
@@ -742,14 +758,13 @@ def main():
                     with results_container:
                         display_final_results(st.session_state.analysis_df, st.session_state.chunks_df)
                         
-                        if st.session_state.analysis_complete:
+                        if st.session_state.get('analysis_complete', False):
                             display_download_buttons(st.session_state.analysis_df, st.session_state.chunks_df)
                             
                             # Add clear results button
                             if st.button("Clear Results", key="clear_results_button"):
                                 st.session_state.analysis_complete = False
                                 st.session_state.analysis_triggered = False
-                                st.session_state.selected_questions = []
                                 if hasattr(st.session_state, 'analysis_df'):
                                     del st.session_state.analysis_df
                                 if hasattr(st.session_state, 'chunks_df'):
