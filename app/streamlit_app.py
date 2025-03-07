@@ -6,7 +6,7 @@ import json
 import yaml
 import asyncio
 import logging
-from typing import List, Dict, Any, Optional, AsyncGenerator
+from typing import List, Dict, Any, Optional, AsyncGenerator, Tuple
 from pathlib import Path
 import sys
 from dotenv import load_dotenv
@@ -46,9 +46,10 @@ if str(current_dir) not in sys.path:
     sys.path.append(str(current_dir))
 logger.info(f"Added {current_dir} to Python path")
 
-from core.analyzer import DocumentAnalyzer
-from core.prompt_manager import PromptManager
-from core.dataframe_manager import create_analysis_dataframes, create_combined_dataframe
+# Keep relative imports
+from app.core.analyzer import DocumentAnalyzer
+from app.core.prompt_manager import PromptManager
+from app.core.dataframe_manager import create_analysis_dataframes, create_combined_dataframe
 
 # Load environment variables
 load_dotenv()
@@ -559,38 +560,38 @@ def get_uploaded_files_history() -> List[Dict]:
     return sorted(files, key=lambda x: x['date'], reverse=True)
 
 def get_all_cached_answers(question_set: str) -> Dict:
-    """Get all cached answers for a given question set"""
-    # Use relative path from where the app is run
-    cache_path = Path("storage/cache")
+    """Get all cached answers for a question set from all reports"""
+    analyzer = DocumentAnalyzer()  # Get the singleton instance
+    logger.info(f"[ANALYSIS] Looking for cached answers in: {analyzer.cache_path}")
     
-    if not cache_path.exists():
-        log_analysis_step(f"Cache directory not found: {cache_path}")
-        return {}
-        
-    log_analysis_step(f"Looking for cached answers in: {cache_path}")
+    # Log all files in cache directory first
+    all_files = glob.glob(f"{analyzer.cache_path}/*")
+    logger.info(f"All files in cache directory: {all_files}")
+    
+    # Get all cache files for this question set using the correct pattern
+    pattern = f"{analyzer.cache_path}/*_qs{question_set}.json"
+    logger.info(f"Searching with pattern: {pattern}")
+    cache_files = glob.glob(pattern)
+    logger.info(f"Found cache files: {cache_files}")
+    
     all_answers = {}
     
-    # Look for all cache files for this question set
-    pattern = f"*_{question_set}_answers.json"
-    log_analysis_step(f"Searching for files matching: {pattern}")
-    
-    for cache_file in cache_path.glob(pattern):
+    for cache_file in cache_files:
         try:
-            log_analysis_step(f"Found cache file: {cache_file}")
-            with open(cache_file, 'r', encoding='utf-8') as f:
+            with open(cache_file, 'r') as f:
+                # Extract file key from cache filename - just get the document name part
+                file_name = Path(cache_file).stem
+                # Get everything before the first '_cs' which marks the start of parameters
+                file_key = file_name.split('_cs')[0]
                 answers = json.load(f)
-                # Extract report name from filename (first part before underscore)
-                report_name = cache_file.stem.split('_')[0]
-                all_answers[report_name] = answers
-                log_analysis_step(f"Loaded {len(answers)} answers for {report_name}")
+                all_answers[file_key] = answers
+                logger.info(f"Successfully loaded cached answers for {file_key} from {cache_file}")
         except Exception as e:
-            log_analysis_step(f"Error loading cache file {cache_file}: {str(e)}", "warning")
+            logger.error(f"Error loading cache file {cache_file}: {str(e)}")
+            logger.error(f"Stack trace: {traceback.format_exc()}")
+            continue
     
-    if not all_answers:
-        log_analysis_step(f"No cached answers found for question set {question_set}")
-    else:
-        log_analysis_step(f"Found cached answers for {len(all_answers)} reports")
-    
+    logger.info(f"Total cached answers loaded: {len(all_answers)}")
     return all_answers
 
 def create_coverage_matrix(question_set: str) -> pd.DataFrame:
@@ -612,104 +613,321 @@ def create_coverage_matrix(question_set: str) -> pd.DataFrame:
     
     return pd.DataFrame(matrix_data)
 
-def display_consolidated_results(question_set: str):
-    """Display consolidated results for all reports in a question set"""
-    all_answers = get_all_cached_answers(question_set)
-    
-    if not all_answers:
-        st.warning(f"No cached answers found for question set {question_set}")
-        return
+def create_analysis_dataframes(cached_results: Dict) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Create analysis and chunks dataframes from database results."""
+    try:
+        analysis_rows = []
+        chunks_rows = []
         
-    # Create consolidated DataFrames
-    all_analysis = []
-    all_chunks = []
-    
-    for report_name, answers in all_answers.items():
-        analysis_df, chunks_df = create_analysis_dataframes(answers, report_name)
-        all_analysis.append(analysis_df)
-        all_chunks.append(chunks_df)
-    
-    consolidated_analysis = pd.concat(all_analysis, ignore_index=True)
-    consolidated_chunks = pd.concat(all_chunks, ignore_index=True)
-    
-    # Display coverage matrix
-    st.subheader("Analysis Coverage")
-    coverage_matrix = create_coverage_matrix(question_set)
-    st.dataframe(coverage_matrix, use_container_width=True)
-    
-    # Display consolidated results
-    st.subheader("All Analysis Results")
-    st.dataframe(consolidated_analysis, use_container_width=True)
-    
-    st.subheader("All Document Chunks")
-    st.dataframe(consolidated_chunks, use_container_width=True)
-    
-    # Add download buttons
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.download_button(
-            "Download Coverage Matrix (CSV)",
-            coverage_matrix.to_csv(index=False),
-            f"{question_set}_coverage_matrix.csv",
-            "text/csv"
-        )
-    with col2:
-        st.download_button(
-            "Download All Analysis (CSV)",
-            consolidated_analysis.to_csv(index=False),
-            f"{question_set}_all_analysis.csv",
-            "text/csv"
-        )
-    with col3:
-        st.download_button(
-            "Download All Chunks (CSV)",
-            consolidated_chunks.to_csv(index=False),
-            f"{question_set}_all_chunks.csv",
-            "text/csv"
-        )
+        logger.info(f"Creating dataframes from results: {cached_results}")
+        
+        # Handle each question's results
+        for question_id, result_json in cached_results.items():
+            try:
+                # Parse the JSON string if needed
+                if isinstance(result_json, str):
+                    result = json.loads(result_json)
+                else:
+                    result = result_json
+                
+                # Helper function to convert lists to strings
+                def convert_to_string(value):
+                    if isinstance(value, list):
+                        return '\n'.join(str(item) for item in value)
+                    return str(value) if value is not None else ''
+                
+                # Create analysis row with string conversions
+                analysis_row = {
+                    'Question ID': str(question_id),
+                    'Analysis': str(result.get('answer', '')),
+                    'Score': float(result.get('score', 0)),
+                    'Key Evidence': convert_to_string([e.get('text', '') for e in result.get('evidence', [])]),
+                    'Gaps': convert_to_string(result.get('gaps', [])),
+                    'Sources': convert_to_string(result.get('sources', []))
+                }
+                analysis_rows.append(analysis_row)
+                
+                # Process chunks
+                chunks = result.get('chunks', result.get('CHUNKS', []))
+                evidence_list = result.get('evidence', result.get('EVIDENCE', []))
+                evidence_texts = [str(e.get('text', '')) for e in evidence_list]
+                
+                for i, chunk in enumerate(chunks):
+                    chunk_text = str(chunk.get('text', ''))
+                    chunk_row = {
+                        'Question ID': str(question_id),
+                        'Chunk Text': chunk_text,
+                        'Vector Similarity': float(chunk.get('similarity', chunk.get('SIMILARITY', 0.0))),
+                        'LLM Score': float(chunk.get('llm_score', chunk.get('LLM_SCORE', 0.0))),
+                        'Evidence Reference': bool(any(chunk_text in evidence_text for evidence_text in evidence_texts)),
+                        'Position': i + 1
+                    }
+                    chunks_rows.append(chunk_row)
+                    
+            except Exception as e:
+                logger.error(f"Error processing result for question {question_id}: {str(e)}")
+                logger.error(f"Result data: {result_json}")
+                continue
+        
+        # Create DataFrames
+        analysis_df = pd.DataFrame(analysis_rows) if analysis_rows else pd.DataFrame()
+        chunks_df = pd.DataFrame(chunks_rows) if chunks_rows else pd.DataFrame()
+        
+        # Ensure all object columns are strings
+        for df in [analysis_df, chunks_df]:
+            if not df.empty:
+                for col in df.select_dtypes(include=['object']).columns:
+                    df[col] = df[col].astype(str)
+        
+        logger.info(f"Created dataframes - Analysis: {len(analysis_rows)} rows, Chunks: {len(chunks_rows)} rows")
+        logger.info(f"Analysis columns dtypes: {analysis_df.dtypes.to_dict() if not analysis_df.empty else 'No data'}")
+        
+        return analysis_df, chunks_df
+        
+    except Exception as e:
+        logger.error(f"Error creating dataframes: {str(e)}")
+        return pd.DataFrame(), pd.DataFrame()
 
-def get_available_caches(base_filename: str) -> List[str]:
-    """Get list of available cache files for a given base filename"""
-    # Look for cache files matching the pattern
-    cache_pattern = f"*{Path(base_filename).stem}*_answers.json"
-    cache_files = glob.glob(f"cache/{cache_pattern}")
-    # Extract just the configuration part of the filename
-    return [Path(f).stem.replace('_answers', '') for f in cache_files]
+def display_analysis_results(analysis_df: pd.DataFrame, chunks_df: pd.DataFrame, file_key: str = None) -> None:
+    """Display analysis results in a consistent format for both individual and consolidated views"""
+    try:
+        if analysis_df.empty:
+            st.warning("No analysis results to display")
+            return
+            
+        # Analysis Results Table
+        st.subheader("Analysis Results")
+        st.dataframe(
+            data=analysis_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Question ID": st.column_config.TextColumn(
+                    "Question ID",
+                    width="small",
+                ),
+                "Analysis": st.column_config.TextColumn(
+                    "Analysis",
+                    width="large",
+                ),
+                "Score": st.column_config.NumberColumn(
+                    "Score",
+                    min_value=0,
+                    max_value=10,
+                    format="%.1f",
+                    width="small",
+                ),
+                "Key Evidence": st.column_config.TextColumn(
+                    "Key Evidence",
+                    width="medium",
+                ),
+                "Gaps": st.column_config.TextColumn(
+                    "Gaps",
+                    width="medium",
+                ),
+                "Sources": st.column_config.TextColumn(
+                    "Sources",
+                    width="small",
+                )
+            }
+        )
+        
+        # Document Chunks Table
+        if not chunks_df.empty:
+            st.subheader("Document Chunks")
+            st.dataframe(
+                data=filter_dataframe(chunks_df),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Question ID": st.column_config.TextColumn(
+                        "Question ID",
+                        width="small",
+                    ),
+                    "Chunk Text": st.column_config.TextColumn(
+                        "Text",
+                        width="large",
+                    ),
+                    "Vector Similarity": st.column_config.NumberColumn(
+                        "Vector Similarity",
+                        min_value=0,
+                        max_value=1,
+                        format="%.3f",
+                    ),
+                    "LLM Score": st.column_config.NumberColumn(
+                        "LLM Score",
+                        min_value=0,
+                        max_value=1,
+                        format="%.3f",
+                    ),
+                    "Evidence Reference": st.column_config.CheckboxColumn(
+                        "Is Evidence",
+                    ),
+                    "Position": st.column_config.NumberColumn(
+                        "Position",
+                        width="small",
+                    )
+                }
+            )
+            
+        # Add download buttons if file_key is provided
+        if file_key:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(
+                    "Download Analysis Results",
+                    convert_df(analysis_df),
+                    f"analysis_results_{file_key}.csv",
+                    "text/csv",
+                    key=f"download_analysis_{file_key}"
+                )
+            
+            with col2:
+                st.download_button(
+                    "Download Chunks",
+                    convert_df(chunks_df),
+                    f"chunks_{file_key}.csv",
+                    "text/csv",
+                    key=f"download_chunks_{file_key}"
+                )
+                
+    except Exception as e:
+        logger.error(f"Error displaying analysis results: {str(e)}", exc_info=True)
+        st.error(f"Error displaying results: {str(e)}")
+
+def display_consolidated_results(question_set: str):
+    """Display consolidated results for all reports"""
+    try:
+        # Initialize analyzer and set question set
+        analyzer = ReportAnalyzer()
+        analyzer.analyzer.update_question_set(question_set)
+        
+        # Get all available cache configurations
+        cache_configs = analyzer.analyzer.cache_manager.check_cache_status()
+        logger.info(f"Found cache configs: {cache_configs}")  # Debug log
+        
+        if not cache_configs:
+            st.warning("No cached analyses found")
+            return
+            
+        # Create a readable format for the config selection
+        config_options = []
+        for config in cache_configs:
+            if len(config) == 6:  # Full config row from cache_status
+                file_path, chunk_size, chunk_overlap, top_k, model, qs = config
+                if qs == question_set:  # Only show configs for selected question set
+                    label = f"File: {Path(file_path).name}, Chunk: {chunk_size}, Overlap: {chunk_overlap}, Top-K: {top_k}, Model: {model}"
+                    config_options.append({
+                        'label': label,
+                        'config': {
+                            'file_path': file_path,
+                            'chunk_size': chunk_size,
+                            'chunk_overlap': chunk_overlap,
+                            'top_k': top_k,
+                            'model': model,
+                            'question_set': qs
+                        }
+                    })
+        
+        if not config_options:
+            st.warning(f"No cached results found for question set: {question_set}")
+            return
+            
+        # Let user select a configuration
+        st.subheader("Select Analysis Configuration")
+        selected_config = st.selectbox(
+            "Choose a configuration",
+            options=config_options,
+            format_func=lambda x: x['label'],
+            key="consolidated_config_select"
+        )
+        
+        if selected_config:
+            # Get results for selected configuration
+            cached_results = analyzer.analyzer.cache_manager.get_analysis(
+                file_path=selected_config['config']['file_path'],
+                config=selected_config['config']
+            )
+            
+            if cached_results:
+                # Process answers into dataframes
+                analysis_df, chunks_df = create_analysis_dataframes(cached_results)
+                
+                # Display results
+                display_analysis_results(analysis_df, chunks_df)
+                
+                # Add download buttons
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.download_button(
+                        "Download Analysis Results",
+                        convert_df(analysis_df),
+                        f"analysis_results_{question_set}.csv",
+                        "text/csv",
+                        key=f"download_analysis_{question_set}"
+                    )
+                
+                with col2:
+                    st.download_button(
+                        "Download Chunks",
+                        convert_df(chunks_df),
+                        f"chunks_{question_set}.csv",
+                        "text/csv",
+                        key=f"download_chunks_{question_set}"
+                    )
+            else:
+                st.warning("No results found for selected configuration")
+                
+    except Exception as e:
+        logger.error(f"Error displaying consolidated results: {str(e)}", exc_info=True)
+        st.error(f"Error displaying consolidated results: {str(e)}")
 
 def display_cache_selector(file_path: str):
-    """Display dropdown with available cache files"""
-    available_caches = get_available_caches(file_path)
-    if available_caches:
-        st.subheader("Available Cache Files")
-        selected_cache = st.selectbox(
-            "Select cached analysis to load",
-            options=available_caches,
-            format_func=lambda x: f"Cache: {x}",
-            key=f"cache_selector_{int(time.time() * 1000)}"
-        )
-        if st.button("Load Selected Cache"):
-            # Extract parameters from cache filename
-            parts = selected_cache.split('_')
-            # Store parameters to use as default values for the UI widgets
-            st.session_state.new_chunk_size = 500  # default value
-            st.session_state.new_overlap = 20      # default value
-            st.session_state.new_top_k = 5         # default value
-            st.session_state.new_llm_model = LLM_MODELS[0]  # default value
-            
-            for part in parts:
-                if part.startswith('cs'):
-                    st.session_state.new_chunk_size = int(part[2:])
-                elif part.startswith('ov'):
-                    st.session_state.new_overlap = int(part[2:])
-                elif part.startswith('tk'):
-                    st.session_state.new_top_k = int(part[2:])
-                elif part.startswith('m'):
-                    st.session_state.new_llm_model = part[1:]
-            
-            # Trigger rerun to update the UI widgets with new values
-            st.experimental_rerun()
-    else:
-        st.info("No cached analyses available for this file")
+    """Display cache management options"""
+    st.subheader("Cache Management")
+    
+    # Get current configuration
+    current_config = {
+        'chunk_size': st.session_state.new_chunk_size,
+        'chunk_overlap': st.session_state.new_overlap,
+        'top_k': st.session_state.new_top_k,
+        'model': st.session_state.new_llm_model,
+        'question_set': st.session_state.new_question_set
+    }
+    
+    if 'analyzer' in st.session_state:
+        # Show cache status using cache manager
+        try:
+            cache_entries = st.session_state.analyzer.analyzer.cache_manager.check_cache_status(file_path)
+            if cache_entries:
+                st.text(f"Found {len(cache_entries)} cached configurations:")
+                for entry in cache_entries:
+                    st.text(f"• Configuration: {entry}")
+                
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.text(f"Current configuration: {current_config}")
+                
+                with col2:
+                    if st.button("🔄 Clear Cache for File"):
+                        try:
+                            st.session_state.analyzer.analyzer.cache_manager.clear_cache(file_path)
+                            st.success(f"Cache cleared for file.")
+                            # Clear results from session state
+                            if 'results' in st.session_state:
+                                del st.session_state.results
+                            if 'analysis_df' in st.session_state:
+                                del st.session_state.analysis_df
+                            if 'chunks_df' in st.session_state:
+                                del st.session_state.chunks_df
+                            st.session_state.analysis_complete = False
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error clearing cache: {str(e)}")
+            else:
+                st.info("No cached analyses available for this file")
+        except Exception as e:
+            st.error(f"Error checking cache status: {str(e)}")
 
 def get_current_settings(st) -> dict:
     """Get all current settings from the UI widgets"""
@@ -726,13 +944,183 @@ def get_current_settings(st) -> dict:
         'selected_set': st.session_state.get('new_question_set', default_set)
     }
 
+def update_analyzer_parameters():
+    """Update analyzer parameters based on current session state"""
+    if 'analyzer' in st.session_state:
+        # Log current values before update
+        logger.info(f"Updating analyzer parameters:")
+        logger.info(f"- Chunk size: {st.session_state.new_chunk_size}")
+        logger.info(f"- Overlap: {st.session_state.new_overlap}")
+        logger.info(f"- Top K: {st.session_state.new_top_k}")
+        logger.info(f"- Model: {st.session_state.new_llm_model}")
+        
+        # Update analyzer parameters
+        st.session_state.analyzer.analyzer.update_parameters(
+            chunk_size=st.session_state.new_chunk_size,
+            chunk_overlap=st.session_state.new_overlap,
+            top_k=st.session_state.new_top_k
+        )
+        st.session_state.analyzer.analyzer.update_llm_model(st.session_state.new_llm_model)
+        
+        # Log updated values to verify
+        logger.info("Updated analyzer parameters:")
+        logger.info(f"- Chunk size: {st.session_state.analyzer.analyzer.chunk_params['chunk_size']}")
+        logger.info(f"- Overlap: {st.session_state.analyzer.analyzer.chunk_params['chunk_overlap']}")
+        logger.info(f"- Top K: {st.session_state.analyzer.analyzer.chunk_params['top_k']}")
+        logger.info(f"- Model: {st.session_state.analyzer.analyzer.llm.model}")
+
+def display_analysis_results2():
+    """Display analysis results in tabs"""
+    logger.info("Starting display_analysis_results")
+    
+    if not hasattr(st.session_state, 'analysis_df'):
+        logger.warning("No analysis_df in session state")
+        st.info("No analysis results to display.")
+        return
+        
+    if st.session_state.analysis_df.empty:
+        logger.warning("analysis_df is empty")
+        st.info("No analysis results to display.")
+        return
+        
+    logger.info(f"Analysis DataFrame shape: {st.session_state.analysis_df.shape}")
+    logger.info(f"Analysis DataFrame contents:\n{st.session_state.analysis_df.to_dict('records')}")
+    
+    tab1, tab2 = st.tabs(["Analysis Results", "Document Chunks"])
+    with tab1:
+        # Simply display all results we have
+        for _, row in st.session_state.analysis_df.iterrows():
+            logger.info(f"Displaying row for question {row['Question ID']}")
+            import pdb; pdb.set_trace()
+            with st.expander(f"Q{row['Question ID']}:", expanded=True):
+                st.markdown(f"**Analysis**: {row['Analysis']}")
+                st.markdown(f"**Score**: {row['Score']}")
+                if row['Key Evidence']:
+                    st.markdown("**Key Evidence**:")
+                    st.markdown(row['Key Evidence'])
+                if row['Gaps']:
+                    st.markdown("**Gaps**:")
+                    st.markdown(row['Gaps'])
+                if row['Sources']:
+                    st.markdown("**Sources**:")
+                    st.markdown(row['Sources'])
+    
+    with tab2:
+        if hasattr(st.session_state, 'chunks_df') and not st.session_state.chunks_df.empty:
+            logger.info(f"Chunks DataFrame shape: {st.session_state.chunks_df.shape}")
+            st.dataframe(
+                st.session_state.chunks_df,
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            logger.info("No chunks data to display")
+            st.info("No chunk data available")
+
+async def run_analysis(analyzer, file_path: str, selected_questions: list, progress_text):
+    """Run the analysis process asynchronously"""
+    try:
+        # ... existing code ...
+        
+        # Update display using the new function
+        if hasattr(st.session_state, 'analysis_df') and hasattr(st.session_state, 'chunks_df'):
+            file_key = generate_file_key(file_path, st)
+            display_analysis_results(
+                st.session_state.analysis_df,
+                st.session_state.chunks_df,
+                file_key
+            )
+            
+    except Exception as e:
+        logger.error(f"Error during analysis: {str(e)}", exc_info=True)
+        st.error(f"Error during analysis: {str(e)}")
+
+def inspect_cache_database():
+    """Inspect and display the contents of the SQLite cache database"""
+    try:
+        analyzer = ReportAnalyzer()
+        cache_manager = analyzer.analyzer.cache_manager
+        
+        # Get all cache configurations using existing method
+        cache_configs = cache_manager.check_cache_status()
+        st.write(f"Database path: {cache_manager.db_path}")
+        
+        if not cache_configs:
+            st.warning("No cached analyses found")
+            return
+            
+        st.write(f"Found {len(cache_configs)} cached configurations")
+        
+        # Show the raw results including chunks
+        st.subheader("Cached Results with Chunks:")
+        for config in cache_configs:
+            if len(config) == 6:  # Full config row
+                file_path, chunk_size, chunk_overlap, top_k, model, question_set = config
+                
+                # Get analysis using existing cache manager method
+                results = cache_manager.get_analysis(
+                    file_path=file_path,
+                    config={
+                        'chunk_size': chunk_size,
+                        'chunk_overlap': chunk_overlap,
+                        'top_k': top_k,
+                        'model': model,
+                        'question_set': question_set
+                    }
+                )
+                
+                st.write(f"\n**Configuration:**")
+                st.write(f"- File: {Path(file_path).name}")
+                st.write(f"- Settings: Chunk={chunk_size}, Overlap={chunk_overlap}, Top-K={top_k}")
+                st.write(f"- Model: {model}")
+                st.write(f"- Question Set: {question_set}")
+                
+                if results:
+                    for question_id, result in results.items():
+                        st.write(f"\n**Question {question_id}**")
+                        try:
+                            if isinstance(result, str):
+                                result = json.loads(result)
+                                
+                            st.write("Answer:", result.get('answer', 'No answer'))
+                            st.write("Score:", result.get('score', 'No score'))
+                            
+                            # Display chunks if they exist
+                            chunks = result.get('chunks', result.get('CHUNKS', []))
+                            if chunks:
+                                st.write(f"Found {len(chunks)} chunks:")
+                                for i, chunk in enumerate(chunks, 1):
+                                    st.write(f"\nChunk {i}:")
+                                    st.write("Text:", chunk.get('text', 'No text'))
+                                    st.write("Similarity:", chunk.get('similarity', chunk.get('SIMILARITY', 'No similarity')))
+                                    st.write("LLM Score:", chunk.get('llm_score', chunk.get('LLM_SCORE', 'No LLM score')))
+                            else:
+                                st.write("No chunks found in result")
+                                
+                            # Show the complete raw JSON if needed
+                            if st.checkbox(f"Show raw JSON for Question {question_id}", key=f"raw_{file_path}_{question_id}"):
+                                st.json(result)
+                                
+                        except Exception as e:
+                            st.error(f"Error processing result for question {question_id}: {str(e)}")
+                else:
+                    st.warning(f"No results found for this configuration")
+                    
+    except Exception as e:
+        logger.error(f"Error inspecting cache: {str(e)}", exc_info=True)
+        st.error(f"Error inspecting cache: {str(e)}")
+
 def main():
     try:
         st.set_page_config(page_title="Report Analyst", layout="wide")
         
         # Initialize analyzer with default question set
         try:
-            analyzer = ReportAnalyzer()
+            # Initialize analyzer and store in session state if not already there
+            if 'analyzer' not in st.session_state:
+                st.session_state.analyzer = ReportAnalyzer()
+            analyzer = st.session_state.analyzer  # Use the stored analyzer
+            
         except Exception as e:
             st.error(f"Error initializing analyzer: {str(e)}")
             st.exception(e)
@@ -750,7 +1138,8 @@ def main():
                     options=list(question_sets.keys()),
                     format_func=lambda x: question_sets[x]['name'],
                     key="new_question_set",
-                    index=0  # Ensure a default is selected
+                    index=0,  # Ensure a default is selected
+                    on_change=update_analyzer_parameters
                 )
             
             # Show question set description
@@ -779,7 +1168,8 @@ def main():
                     "LLM Model", 
                     options=LLM_MODELS,
                     index=0,  # Ensure a default is selected
-                    key="new_llm_model"
+                    key="new_llm_model",
+                    on_change=update_analyzer_parameters
                 )
             
             # Chunking parameters
@@ -790,7 +1180,8 @@ def main():
                     min_value=100,
                     max_value=2000,
                     value=500,  # Default value
-                    key="new_chunk_size"
+                    key="new_chunk_size",
+                    on_change=update_analyzer_parameters
                 )
             with col2:
                 new_overlap = st.number_input(
@@ -798,7 +1189,8 @@ def main():
                     min_value=0,
                     max_value=100,
                     value=20,  # Default value
-                    key="new_overlap"
+                    key="new_overlap",
+                    on_change=update_analyzer_parameters
                 )
             with col3:
                 new_top_k = st.number_input(
@@ -806,27 +1198,21 @@ def main():
                     min_value=1,
                     max_value=20,
                     value=5,  # Default value
-                    key="new_top_k"
+                    key="new_top_k",
+                    on_change=update_analyzer_parameters
                 )
 
-        # Now these values will be available in session_state for the rest of the app
-        # We can access them as st.session_state.new_chunk_size, etc.
+        # Create tabs
+        file_tab, upload_tab, consolidated_tab = st.tabs([
+            "Previous Reports",
+            "Upload New",
+            "Consolidated Results"
+        ])
 
-        # Use the selected settings from session state
-        selected_set = st.session_state.get('selected_set', selected_set)
-        
-        # File selection/upload
-        st.subheader("Select Report")
-        file_tab, upload_tab, consolidated_tab = st.tabs(["Previous Reports", "Upload New", "Consolidated Results"])
-        
-        # Reset analysis state when switching files
-        if 'current_file' not in st.session_state:
-            st.session_state.current_file = None
-        
+        # Previous Reports tab
         with file_tab:
             previous_files = get_uploaded_files_history()
             if previous_files:
-                    
                 selected_file = st.selectbox(
                     "Select a previously analyzed report",
                     options=previous_files,
@@ -836,182 +1222,94 @@ def main():
                 if selected_file:
                     file_path = Path(selected_file['path'])
                     if file_path.exists():
-                        # Update current file and trigger analysis
-                        if str(file_path) != st.session_state.current_file:
-                            st.session_state.current_file = str(file_path)
-                            st.session_state.uploaded_file = file_path
-                            # Reset analysis state but keep results
-                            st.session_state.analysis_complete = False
-                            st.session_state.analysis_triggered = True  # Set to True to trigger analysis
-                            st.experimental_rerun()
+                        # Load questions and handle selection
+                        question_set_data = analyzer.load_question_set(st.session_state.new_question_set)
+                        questions = question_set_data["questions"]
+                        
+                        if question_set_data["description"]:
+                            st.write(question_set_data["description"])
+                        
+                        # Add question selection UI
+                        st.subheader("Select Questions")
+                        selected_questions = []
+                        for q_id, q_data in questions.items():
+                            if st.checkbox(
+                                f"{q_id}: {q_data['text']}", 
+                                key=f"individual_question_{q_id}"
+                            ):
+                                selected_questions.append(q_id)
+                        
+                        # Analysis button and results
+                        if st.button("Analyze Selected Questions", key="analyze_button"):
+                            if not selected_questions:
+                                st.warning("Please select at least one question to analyze.")
+                            else:
+                                try:
+                                    # Get results from cache or run new analysis
+                                    cached_results = analyzer.analyzer.cache_manager.get_analysis(
+                                        file_path=str(file_path),
+                                        config={
+                                            'chunk_size': st.session_state.new_chunk_size,
+                                            'chunk_overlap': st.session_state.new_overlap,
+                                            'top_k': st.session_state.new_top_k,
+                                            'model': st.session_state.new_llm_model,
+                                            'question_set': st.session_state.new_question_set
+                                        }
+                                    )
+                                    
+                                    if cached_results:
+                                        # Process answers into dataframes
+                                        analysis_df, chunks_df = create_analysis_dataframes(cached_results)
+                                        
+                                        # Display results using the working function
+                                        file_key = Path(file_path).stem
+                                        display_analysis_results(analysis_df, chunks_df, file_key)
+                                    else:
+                                        st.warning("No results found. Running new analysis...")
+                                        # Run new analysis if needed
+                                        progress_text = st.empty()
+                                        progress_text.info("Starting analysis...")
+                                        
+                                        asyncio.run(run_analysis(
+                                            analyzer=analyzer,
+                                            file_path=str(file_path),
+                                            selected_questions=selected_questions,
+                                            progress_text=progress_text
+                                        ))
+                                        
+                                except Exception as e:
+                                    logger.error(f"Error during analysis: {str(e)}", exc_info=True)
+                                    st.error(f"Error during analysis: {str(e)}")
                     else:
                         st.error(f"File not found: {file_path}")
             else:
                 st.info("No previously analyzed reports found")
-        
+
+        # Upload New tab
         with upload_tab:
             uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", key="file_uploader")
             if uploaded_file:
-                # Save the uploaded file and update session state
                 file_path = save_uploaded_file(uploaded_file)
                 if file_path and file_path != st.session_state.get('current_file'):
                     st.session_state.current_file = file_path
                     st.session_state.uploaded_file = uploaded_file
-                    # Reset analysis state
                     st.session_state.analysis_complete = False
                     st.session_state.analysis_triggered = False
                     if 'results' in st.session_state:
                         del st.session_state.results
                     st.success(f"File uploaded successfully: {uploaded_file.name}")
-                    # Only rerun if we haven't processed this file yet
                     if not st.session_state.get('file_processed'):
                         st.session_state.file_processed = True
                         st.rerun()
-        
-        if st.session_state.get('uploaded_file'):
-            try:
-                # Load questions and handle selection
-                question_set_data = analyzer.load_question_set(selected_set)
-                questions = question_set_data["questions"]
-                
-                if question_set_data["description"]:
-                    st.write(question_set_data["description"])
-                
-                # Add question selection UI with Select All toggle
-                st.subheader("Select Questions")
-                
-                # Initialize selected_questions in session state if not present
-                if 'selected_questions' not in st.session_state:
-                    st.session_state.selected_questions = list(questions.keys())
-                
-                # Select All toggle
-                select_all = st.checkbox("Select All Questions", 
-                                       value=len(st.session_state.selected_questions) == len(questions),
-                                       key="select_all")
-                
-                # Handle select all / deselect all
-                if select_all:
-                    st.session_state.selected_questions = list(questions.keys())
-                else:
-                    st.session_state.selected_questions = []
-                
-                # Individual question checkboxes
-                selected_questions = []
-                for q_id, q_data in questions.items():
-                    if st.checkbox(
-                        f"{q_id}: {q_data['text']}", 
-                        value=q_id in st.session_state.selected_questions,
-                        key=f"question_{q_id}"
-                    ):
-                        selected_questions.append(q_id)
-                
-                # Update session state
-                st.session_state.selected_questions = selected_questions
-                
-                # Create a single results container
-                results_container = st.container()
-                
-                # Track configuration changes
-                current_config = get_current_settings(st)
-                
-                # Check if configuration has changed
-                if 'last_config' not in st.session_state or st.session_state.last_config != current_config:
-                    # Clear results and trigger reanalysis
-                    if 'results' in st.session_state:
-                        del st.session_state.results
-                    if 'analysis_df' in st.session_state:
-                        del st.session_state.analysis_df
-                    if 'chunks_df' in st.session_state:
-                        del st.session_state.chunks_df
-                    if 'analyzed_files' in st.session_state:
-                        del st.session_state.analyzed_files
-                    st.session_state.analysis_complete = False
-                    st.session_state.analysis_triggered = True
-                    st.session_state.last_config = current_config
-                    st.experimental_rerun()
-                
-                # Add analysis trigger with proper state handling
-                if st.button("Analyze Selected Questions", key="analyze_button"):
-                    if not selected_questions:
-                        st.warning("Please select at least one question to analyze.")
-                    else:
-                        st.session_state.analysis_triggered = True
-                        
-                        # Show progress
-                        progress_text = st.empty()
-                        progress_text.info("Starting analysis...")
-                        
-                        # Generate current file key based on configuration
-                        file_key = generate_file_key(st.session_state.current_file, st)
-                        
-                        # Check cache first
-                        cached = analyzer.analyzer._load_cached_answers(st.session_state.current_file)
-                        
-                        # Filter cached answers to only include current question set
-                        if cached:
-                            cached = {k: v for k, v in cached.items() 
-                                    if k in selected_questions}
-                            
-                            if cached:
-                                progress_text.info(f"Found {len(cached)} cached answers")
-                                # Update results with cached answers
-                                st.session_state.results = {"answers": cached}
-                                
-                                # Create dataframes from cached results
-                                analysis_df, chunks_df = create_analysis_dataframes(
-                                    cached,
-                                    file_key
-                                )
-                                st.session_state.analysis_df = analysis_df
-                                st.session_state.chunks_df = chunks_df
-                        
-                        # Determine which questions need processing
-                        questions_to_process = [q_id for q_id in selected_questions 
-                                              if q_id not in cached]
-                        
-                        if questions_to_process:
-                            progress_text.info(f"Processing {len(questions_to_process)} uncached questions...")
-                            
-                            # Update analyzer parameters
-                            analyzer.analyzer.update_parameters(
-                                chunk_size=st.session_state.new_chunk_size,
-                                chunk_overlap=st.session_state.new_overlap,
-                                top_k=st.session_state.new_top_k
-                            )
-                            analyzer.analyzer.update_llm_model(st.session_state.new_llm_model)
-                            
-                            try:
-                                # Run analysis for uncached questions
-                                asyncio.run(analyze_document_and_display(
-                                    analyzer=analyzer,
-                                    file_path=st.session_state.current_file,
-                                    questions=questions,
-                                    selected_questions=questions_to_process,
-                                    use_llm_scoring=st.session_state.new_llm_scoring,
-                                    single_call=st.session_state.new_batch_scoring
-                                ))
-                                
-                                progress_text.success("Analysis complete!")
-                                
-                            except Exception as e:
-                                st.error(f"Error during analysis: {str(e)}")
-                                st.exception(e)
-                        else:
-                            progress_text.success("All selected questions loaded from cache!")
-                        
-                        # Display results if available
-                        if hasattr(st.session_state, 'analysis_df'):
-                            display_final_results(
-                                st.session_state.analysis_df,
-                                st.session_state.chunks_df
-                            )
 
-            except Exception as e:
-                st.error(f"Error processing uploaded file: {str(e)}")
-            
+        # Consolidated Results tab
         with consolidated_tab:
-            st.subheader("View All Results")
+            st.header("View All Results")
             st.write("View and export consolidated results for all analyzed reports")
+            
+            # Add debug button for cache inspection
+            if st.button("Inspect Cache Database", key="inspect_cache"):
+                inspect_cache_database()
             
             # Question set selection for consolidated view
             selected_set = st.selectbox(
@@ -1022,6 +1320,11 @@ def main():
             )
             
             if selected_set:
+                # Show question set description
+                if selected_set in question_sets:
+                    st.info(question_sets[selected_set]['description'])
+                
+                # Only show consolidated results
                 display_consolidated_results(selected_set)
 
         # Add Climate+Tech footer at the end
@@ -1052,14 +1355,10 @@ def main():
         """
         st.markdown(footer, unsafe_allow_html=True)
 
-        # Add this to the main function where results are displayed
-        if hasattr(st.session_state, 'current_file'):
-            with st.expander("Available Cache Files", expanded=False):
-                display_cache_selector(st.session_state.current_file)
 
     except Exception as e:
         st.error("Error during analysis:")
-        st.exception(e)  # This will show the full traceback
+        st.exception(e)
 
 if __name__ == "__main__":
     main() 
