@@ -80,20 +80,34 @@ if os.getenv("GOOGLE_API_KEY"):
 else:
     logger.warning("No Google API key found - Gemini models will not be available")
 
-question_sets = {
-    "tcfd": {
-        "name": "TCFD Questions",
-        "description": "Task Force on Climate-related Financial Disclosures questions"
-    },
-    "s4m": {
-        "name": "S4M Questions",
-        "description": "Sustainability for Management questions"
-    },
-    "lucia": {
-        "name": "Lucia Sustainability Report Analysis",
-        "description": "Comprehensive question set for analyzing sustainability reports based on Lucia criteria"
-    }
-}
+# Load question sets dynamically using the centralized loader
+def get_question_sets() -> Dict[str, Dict[str, str]]:
+    """Get all available question sets dynamically with Everest at the end"""
+    try:
+        all_sets = question_loader.get_question_set_info()
+        
+        # Reorder to put Everest last
+        ordered_sets = {}
+        everest_data = None
+        
+        # Add all non-Everest sets first
+        for key, value in all_sets.items():
+            if key == 'everest':
+                everest_data = value
+            else:
+                ordered_sets[key] = value
+        
+        # Add Everest at the end if it exists
+        if everest_data:
+            ordered_sets['everest'] = everest_data
+            
+        return ordered_sets
+    except Exception as e:
+        logger.error(f"Error loading question sets: {e}")
+        return {}
+
+# Get question sets at startup
+question_sets = get_question_sets()
 
 class ReportAnalyzer:
     """Class to handle report analysis"""
