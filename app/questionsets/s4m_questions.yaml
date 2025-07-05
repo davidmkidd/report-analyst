@@ -1,5 +1,5 @@
-name: s4m short profile analysis Questions
-description: score4more question set for analyzing sustainability reports
+name:  short profile analysis Questions
+description:  question set for analyzing sustainability reports
 
 questions:
   - id: s4m_1
