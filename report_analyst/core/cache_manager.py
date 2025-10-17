@@ -475,8 +475,13 @@ class CacheManager:
                         continue
                         
                     try:
-                        # Convert embedding to bytes
-                        embedding_bytes = chunk['embedding'].tobytes()
+                        # Convert embedding to bytes with shape information
+                        embedding = chunk['embedding']
+                        embedding_bytes = embedding.tobytes()
+                        # Store shape information in metadata for proper reconstruction
+                        metadata_with_shape = chunk['metadata'].copy()
+                        metadata_with_shape['embedding_shape'] = list(embedding.shape)
+                        metadata_with_shape['embedding_dtype'] = str(embedding.dtype)
                         
                         # Prepare chunk data
                         chunk_data.append((
@@ -485,7 +490,7 @@ class CacheManager:
                             chunk_size,
                             chunk_overlap,
                             embedding_bytes,
-                            json.dumps(chunk['metadata']),
+                            json.dumps(metadata_with_shape),
                             datetime.now().isoformat()
                         ))
                     except Exception as e:
@@ -527,13 +532,36 @@ class CacheManager:
                 chunks = []
                 for row in conn.execute("""
                     SELECT chunk_text, embedding, metadata
-                    FROM vector_cache
+                    FROM document_chunks
                     WHERE file_path = ?
                 """, (str(file_path),)):
+                    metadata = json.loads(row[2])
+                    
+                    # Reconstruct embedding with proper shape
+                    embedding = None
+                    if row[1]:
+                        try:
+                            # Get shape and dtype from metadata
+                            shape = tuple(metadata.get('embedding_shape', []))
+                            dtype = metadata.get('embedding_dtype', 'float32')
+                            
+                            if shape:
+                                embedding = np.frombuffer(row[1], dtype=dtype).reshape(shape)
+                            else:
+                                # Fallback to default shape if not stored
+                                embedding = np.frombuffer(row[1], dtype=np.float32)
+                        except Exception as e:
+                            logger.warning(f"Error reconstructing embedding: {e}")
+                            embedding = None
+                    
+                    # Remove embedding metadata from the returned metadata
+                    clean_metadata = {k: v for k, v in metadata.items() 
+                                    if k not in ['embedding_shape', 'embedding_dtype']}
+                    
                     chunks.append({
                         'text': row[0],
-                        'embedding': np.frombuffer(row[1], dtype=np.float32) if row[1] else None,
-                        'metadata': json.loads(row[2])
+                        'embedding': embedding,
+                        'metadata': clean_metadata
                     })
                 logger.info(f"Retrieved {len(chunks)} vectors for {file_path}")
                 return chunks
@@ -547,11 +575,11 @@ class CacheManager:
             with sqlite3.connect(self.db_path) as conn:
                 if file_path:
                     conn.execute("DELETE FROM analysis_cache WHERE file_path = ?", (str(file_path),))
-                    conn.execute("DELETE FROM vector_cache WHERE file_path = ?", (str(file_path),))
+                    conn.execute("DELETE FROM document_chunks WHERE file_path = ?", (str(file_path),))
                     logger.info(f"Cleared cache for {file_path}")
                 else:
                     conn.execute("DELETE FROM analysis_cache")
-                    conn.execute("DELETE FROM vector_cache")
+                    conn.execute("DELETE FROM document_chunks")
                     logger.info("Cleared all cache")
         except Exception as e:
             logger.error(f"Error clearing cache: {str(e)}", exc_info=True)
