@@ -16,6 +16,8 @@ import streamlit as st
 from .backend_service import BackendService, BackendServiceError, handle_backend_error
 from .config import BackendConfig
 
+logger = logging.getLogger(__name__)
+
 # Add parent directory to path for question loader import
 current_dir = Path(__file__).parent
 parent_dir = current_dir.parent
@@ -31,8 +33,6 @@ try:
 except ImportError as e:
     logger.warning(f"Question loader not available: {e}")
     QUESTION_LOADER_AVAILABLE = False
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
